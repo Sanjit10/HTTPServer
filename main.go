@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	log "log"
 	http "net/http"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	atomic "sync/atomic"
 	"time"
+
 	"github.com/Sanjit10/HTTPServer/internal/database"
 	"github.com/google/uuid"
 	godotenv "github.com/joho/godotenv"
@@ -20,7 +22,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
-	platform 		string
+	platform       string
 }
 
 type User struct {
@@ -77,7 +79,7 @@ func main() {
 	dbQueries := database.New(db)
 	cfg := &apiConfig{
 		dbQueries: dbQueries,
-		platform : platform,
+		platform:  platform,
 	}
 
 	mux := http.NewServeMux()
@@ -111,43 +113,6 @@ func main() {
 	})
 	mux.Handle("GET /admin/metrics", metricsHandler)
 
-	// 5) Validator endpoint
-	validateChirpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close() // Ensure request body is closed
-
-		type reqBody struct { // PascalCase for struct names is standard
-			Body string `json:"body"`
-		}
-		// type okResponse struct { // PascalCase for struct names is standard
-		// 	Valid bool `json:"valid"`
-		// }
-		type responseBody struct {
-			Cleaned_body string `json:"cleaned_body"`
-		}
-
-		// Decode body
-		decoder := json.NewDecoder(r.Body)
-		decodedBody := reqBody{} // PascalCase for variable names is standard
-
-		if err := decoder.Decode(&decodedBody); err != nil {
-			log.Printf("Error decoding parameters: %s", err)
-			respondWithError(w, http.StatusBadRequest, "Invalid JSON body") // Use helper, 400 status
-			return
-		}
-
-		// Body Too large error
-		if len(decodedBody.Body) >= 140 {
-			respondWithError(w, http.StatusBadRequest, "Chirp is too long") // Use helper, 400 status
-			return
-		}
-		profane_words := [3]string{"kerfuffle", "sharbert", "fornax"}
-		new_sentance := censor(decodedBody.Body, profane_words[:])
-		// Success response
-		respondWithJSON(w, http.StatusOK, responseBody{Cleaned_body: new_sentance}) // Use helper
-	})
-
-	mux.Handle("POST /api/validate_chirp", validateChirpHandler) // Renamed handler
-	
 	// 6) User Creation
 	createUserHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -173,10 +138,10 @@ func main() {
 			return
 		}
 		user := User{
-			ID : dbuser.ID,
+			ID:        dbuser.ID,
 			CreatedAt: dbuser.CreatedAt,
 			UpdatedAt: dbuser.UpdatedAt,
-			Email: dbuser.Email,
+			Email:     dbuser.Email,
 		}
 
 		respondWithJSON(w, http.StatusCreated, user)
@@ -190,8 +155,8 @@ func main() {
 			respondWithError(w, http.StatusForbidden, "Could not delete user")
 			return
 		}
-		
-		if err := cfg.dbQueries.DeleteAllUsers(r.Context()) ; err != nil{
+
+		if err := cfg.dbQueries.DeleteAllUsers(r.Context()); err != nil {
 			log.Printf("Error deleteing users : %s", err)
 			respondWithError(w, http.StatusInternalServerError, "Could not delete user")
 			return
@@ -199,6 +164,135 @@ func main() {
 		respondWithJSON(w, 200, nil)
 	})
 	mux.Handle("POST /admin/reset", delete_all_user)
+
+	//8) add chirps
+	post_chirp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		type reqBody struct {
+			UserID uuid.UUID `json:"user_id"`
+			Body   string    `json:"body"`
+		}
+		type Chirp struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    uuid.UUID `json:"user_id"`
+		}
+
+		// Decode body
+		decoder := json.NewDecoder(r.Body)
+		var decodedBody reqBody
+
+		if err := decoder.Decode(&decodedBody); err != nil {
+			log.Printf("Error decoding parameters: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Invalid JSON body") // Use helper, 400 status
+			return
+		}
+
+		// Body Too large error
+		if len(decodedBody.Body) >= 140 {
+			respondWithError(w, http.StatusBadRequest, "Chirp is too long") // Use helper, 400 status
+			return
+		}
+		profane_words := [3]string{"kerfuffle", "sharbert", "fornax"}
+		new_sentance := censor(decodedBody.Body, profane_words[:])
+
+		newChirp, err := cfg.dbQueries.CreateChirps(r.Context(), database.CreateChirpsParams{
+			Body:   new_sentance,
+			UserID: decodedBody.UserID,
+		})
+
+		if err != nil {
+			log.Printf("Error adding Chirps to database: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Error adding chirps to db")
+			return
+		}
+
+		resp := Chirp{
+			ID:        newChirp.ID,
+			CreatedAt: newChirp.CreatedAt,
+			UpdatedAt: newChirp.UpdatedAt,
+			Body:      newChirp.Body,
+			UserID:    newChirp.UserID,
+		}
+		respondWithJSON(w, 201, resp)
+	})
+	mux.Handle("POST /api/chirps", post_chirp)
+
+	// 9) Get all chirps
+	getAllChirps := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		type Chirp struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    uuid.UUID `json:"user_id"`
+		}
+
+		dbChirps, err := cfg.dbQueries.GetAllChirps(r.Context())
+		if err != nil {
+			log.Printf("Error retrieving chirps: %s", err)
+			respondWithError(w, http.StatusInternalServerError, "Could not fetch chirps")
+			return
+		}
+
+		chirps := make([]Chirp, 0, len(dbChirps))
+		for _, c := range dbChirps {
+			chirps = append(chirps, Chirp{
+				ID:        c.ID,
+				CreatedAt: c.CreatedAt,
+				UpdatedAt: c.UpdatedAt,
+				Body:      c.Body,
+				UserID:    c.UserID,
+			})
+		}
+
+		respondWithJSON(w, http.StatusOK, chirps)
+	})
+	mux.Handle("GET /api/chirps", getAllChirps)
+
+	// 10) Get a chirp
+	getOneChirps := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chirp_idStr := r.PathValue("chirp_id")
+		chirp_idUUID, err := uuid.Parse(chirp_idStr)
+		if err != nil {
+			respondWithError(w, 404, "Invalid UUID format")
+			return
+		}
+		type Chirp struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Body      string    `json:"body"`
+			UserID    uuid.UUID `json:"user_id"`
+		}
+
+		dbChirps, err := cfg.dbQueries.GetChirp(r.Context(), chirp_idUUID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Not found
+				respondWithError(w, http.StatusNotFound, "Chirp not found")
+				return
+			}
+			// Other DB error
+			respondWithError(w, http.StatusNotFound, "Database error")
+			return
+		}
+
+		chirp := Chirp{
+			ID:        dbChirps.ID,
+			CreatedAt: dbChirps.CreatedAt,
+			UpdatedAt: dbChirps.UpdatedAt,
+			Body:      dbChirps.Body,
+			UserID:    dbChirps.UserID,
+		}
+
+		respondWithJSON(w, http.StatusOK, chirp)
+	})
+	mux.Handle("GET /api/chirps/{chirp_id}", getOneChirps)
 
 	server := &http.Server{
 		Addr:    ":8080",
