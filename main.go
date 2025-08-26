@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	atomic "sync/atomic"
 	"time"
 
+	"github.com/Sanjit10/HTTPServer/internal/auth"
 	"github.com/Sanjit10/HTTPServer/internal/database"
 	"github.com/google/uuid"
 	godotenv "github.com/joho/godotenv"
@@ -23,6 +25,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	platform       string
+	secret         string
 }
 
 type User struct {
@@ -32,10 +35,38 @@ type User struct {
 	Email     string    `json:"email"`
 }
 
+type contextKey string
+const userContextKey = contextKey("user")
+
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg.fileserverHits.Add(1)
 		next.ServeHTTP(w, r)
+	})
+}
+
+func getUserFromContext(ctx context.Context) (database.User, bool) {
+    user, ok := ctx.Value(userContextKey).(database.User)
+    return user, ok
+}
+
+func (cfg *apiConfig) middlewareJWTtokenValidator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil{
+			log.Printf("Error decoding headers: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Invalid header")
+			return
+		}
+		user_uuid, err := auth.ValidateJWT(token, cfg.secret)
+		user, db_err := cfg.dbQueries.GetUserById(r.Context(), user_uuid)
+		if db_err != nil {
+			log.Printf("Error fetching user: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Invalid uuid")
+			return
+		}
+		ctx := context.WithValue(r.Context(), userContextKey, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -72,6 +103,8 @@ func main() {
 
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
+
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
@@ -80,6 +113,7 @@ func main() {
 	cfg := &apiConfig{
 		dbQueries: dbQueries,
 		platform:  platform,
+		secret:    secret,
 	}
 
 	mux := http.NewServeMux()
@@ -120,13 +154,22 @@ func main() {
 		// Decode JSON body into struct
 		decoder := json.NewDecoder(r.Body)
 		type reqBody struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 		var decodedBody reqBody
 
 		if err := decoder.Decode(&decodedBody); err != nil {
 			log.Printf("Error decoding parameters: %s", err)
 			respondWithError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+
+		// Get the hashed password and set the password in db
+		hashedPassword, error := auth.HashPassword(decodedBody.Password)
+		if error != nil {
+			log.Printf("Error hashing password: %s", err)
+			respondWithError(w, http.StatusInternalServerError, "Could not create user")
 			return
 		}
 
@@ -137,6 +180,20 @@ func main() {
 			respondWithError(w, http.StatusInternalServerError, "Could not create user")
 			return
 		}
+
+		err = cfg.dbQueries.SetUserPassword(
+			r.Context(),
+			database.SetUserPasswordParams{
+				HashedPassword: hashedPassword,
+				ID:             dbuser.ID,
+			})
+
+		if err != nil {
+			log.Printf("Error setting user password: %s", err)
+			respondWithError(w, http.StatusInternalServerError, "Could not create user")
+			return
+		}
+
 		user := User{
 			ID:        dbuser.ID,
 			CreatedAt: dbuser.CreatedAt,
@@ -169,6 +226,12 @@ func main() {
 	post_chirp := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 
+		user, ok := getUserFromContext(r.Context())
+		if !ok {
+			respondWithError(w, http.StatusUnauthorized, "No user in context")
+			return
+    	}
+
 		type reqBody struct {
 			UserID uuid.UUID `json:"user_id"`
 			Body   string    `json:"body"`
@@ -190,6 +253,7 @@ func main() {
 			respondWithError(w, http.StatusBadRequest, "Invalid JSON body") // Use helper, 400 status
 			return
 		}
+		decodedBody.UserID = user.ID
 
 		// Body Too large error
 		if len(decodedBody.Body) >= 140 {
@@ -293,6 +357,81 @@ func main() {
 		respondWithJSON(w, http.StatusOK, chirp)
 	})
 	mux.Handle("GET /api/chirps/{chirp_id}", getOneChirps)
+
+	// 11) Login Endpoint
+	handelLogin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Decode body
+		defer r.Body.Close()
+		type reqBody struct {
+			Password  string `json:"password"`
+			Email     string `json:"email"`
+			ExpiresIn int    `json:"expires_in_seconds"`
+		}
+		decoder := json.NewDecoder(r.Body)
+		var decodedBody reqBody
+		if err := decoder.Decode(&decodedBody); err != nil {
+			log.Printf("Error decoding parameters: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Invalid JSON body") // Use helper, 400 status
+			return
+		}
+
+		// Get UserByEmail
+		user, err := cfg.dbQueries.GetUserByEmail(r.Context(), decodedBody.Email)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Not found
+				respondWithError(w, http.StatusNotFound, "USER not found")
+				return
+			}
+			// Other DB error
+			respondWithError(w, http.StatusInternalServerError, "Database error")
+			return
+		}
+
+		// Check UserHashPassword
+		authorized, err_auth := auth.VerifyPassword(
+			user.HashedPassword,
+			decodedBody.Password,
+		)
+
+		if err_auth != nil || !authorized {
+			log.Printf("Unauthorized User: %s", err_auth)
+			respondWithError(w, http.StatusUnauthorized, "Unauthorized User")
+			return
+		}
+		type RespBody struct {
+			ID        uuid.UUID `json:"id"`
+			CreatedAt time.Time `json:"created_at"`
+			UpdatedAt time.Time `json:"updated_at"`
+			Email     string    `json:"email"`
+			Token     string    `json:"token"`
+		}
+		expires_in := 60 * 60 //seconds
+		if decodedBody.ExpiresIn != 0 && decodedBody.ExpiresIn < expires_in {
+			expires_in = decodedBody.ExpiresIn
+		}
+		token, err_token := auth.MakeJWT(
+			user.ID,
+			cfg.secret,
+			time.Duration(expires_in),
+		)
+		if err_token != nil {
+			log.Printf("Token err: %s", err_token)
+			respondWithError(w, http.StatusUnauthorized, "Token err")
+			return
+		}
+
+		respBody := RespBody{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+			Token:     token,
+		}
+		respondWithJSON(w, 200, respBody)
+
+	})
+	mux.Handle("POST /api/login", handelLogin)
 
 	server := &http.Server{
 		Addr:    ":8080",

@@ -10,3 +10,17 @@ RETURNING *;
 
 -- name: DeleteAllUsers :exec
 DELETE FROM users;
+
+-- name: SetUserPassword :exec
+UPDATE users
+SET hashed_password = $1,
+    updated_at = now()
+WHERE id = $2;
+
+-- name: GetUserByEmail :one
+SELECT * FROM users
+WHERE email = $1;
+
+-- name: GetUserById :one
+SELECT * FROM users
+WHERE id = $1;
