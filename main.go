@@ -36,6 +36,7 @@ type User struct {
 }
 
 type contextKey string
+
 const userContextKey = contextKey("user")
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -46,19 +47,24 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 }
 
 func getUserFromContext(ctx context.Context) (database.User, bool) {
-    user, ok := ctx.Value(userContextKey).(database.User)
-    return user, ok
+	user, ok := ctx.Value(userContextKey).(database.User)
+	return user, ok
 }
 
 func (cfg *apiConfig) middlewareJWTtokenValidator(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, err := auth.GetBearerToken(r.Header)
-		if err != nil{
+		if err != nil {
 			log.Printf("Error decoding headers: %s", err)
 			respondWithError(w, http.StatusBadRequest, "Invalid header")
 			return
 		}
 		user_uuid, err := auth.ValidateJWT(token, cfg.secret)
+		if err != nil {
+			log.Printf("Error validating: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Invalid token")
+			return
+		}
 		user, db_err := cfg.dbQueries.GetUserById(r.Context(), user_uuid)
 		if db_err != nil {
 			log.Printf("Error fetching user: %s", err)
@@ -230,7 +236,7 @@ func main() {
 		if !ok {
 			respondWithError(w, http.StatusUnauthorized, "No user in context")
 			return
-    	}
+		}
 
 		type reqBody struct {
 			UserID uuid.UUID `json:"user_id"`
@@ -283,7 +289,7 @@ func main() {
 		}
 		respondWithJSON(w, 201, resp)
 	})
-	mux.Handle("POST /api/chirps", post_chirp)
+	mux.Handle("POST /api/chirps", cfg.middlewareJWTtokenValidator(post_chirp))
 
 	// 9) Get all chirps
 	getAllChirps := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -413,7 +419,7 @@ func main() {
 		token, err_token := auth.MakeJWT(
 			user.ID,
 			cfg.secret,
-			time.Duration(expires_in),
+			time.Duration(expires_in)*time.Second,
 		)
 		if err_token != nil {
 			log.Printf("Token err: %s", err_token)
