@@ -3,7 +3,9 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/hex"
-
+	"errors"
+	"net/http"
+	"strings"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -33,4 +35,18 @@ func MakeRefreshToken() (string, error) {
     }
     rand_token_string := hex.EncodeToString(rand_byte)
     return rand_token_string, nil
+}
+
+func GetAPIKey(headers http.Header) (string, error) {
+	// Expected header format Authorization: ApiKey THE_KEY_HERE
+	apiKey := headers.Get("Authorization")
+	if apiKey == "" {
+		return "", errors.New("missing API key")
+	}
+	// Split the header value to extract the key
+	parts := strings.SplitN(apiKey, " ", 2)
+	if len(parts) != 2 || parts[0] != "ApiKey" {
+		return "", errors.New("invalid API key format")
+	}
+	return parts[1], nil
 }

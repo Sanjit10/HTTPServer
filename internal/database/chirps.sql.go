@@ -12,9 +12,9 @@ import (
 )
 
 const createChirps = `-- name: CreateChirps :one
-INSERT INTO chirps (body, user_id
-) VALUES ($1, $2)
- RETURNING id, created_at, updated_at, body, user_id
+INSERT INTO chirps (body, user_id)
+VALUES ($1, $2)
+RETURNING id, created_at, updated_at, body, user_id
 `
 
 type CreateChirpsParams struct {
@@ -46,11 +46,13 @@ func (q *Queries) DeleteChirp(ctx context.Context, id uuid.UUID) error {
 
 const getAllChirps = `-- name: GetAllChirps :many
 SELECT id, created_at, updated_at, body, user_id FROM chirps
-ORDER BY created_at ASC
+ORDER BY
+    CASE WHEN $1 = 'asc' THEN created_at END ASC,
+    CASE WHEN $1 = 'desc' THEN created_at END DESC
 `
 
-func (q *Queries) GetAllChirps(ctx context.Context) ([]Chirp, error) {
-	rows, err := q.db.QueryContext(ctx, getAllChirps)
+func (q *Queries) GetAllChirps(ctx context.Context, dollar_1 interface{}) ([]Chirp, error) {
+	rows, err := q.db.QueryContext(ctx, getAllChirps, dollar_1)
 	if err != nil {
 		return nil, err
 	}
@@ -93,4 +95,46 @@ func (q *Queries) GetChirp(ctx context.Context, id uuid.UUID) (Chirp, error) {
 		&i.UserID,
 	)
 	return i, err
+}
+
+const getChirpsByUserID = `-- name: GetChirpsByUserID :many
+SELECT id, created_at, updated_at, body, user_id FROM chirps
+WHERE user_id = $1
+ORDER BY
+    CASE WHEN $2 = 'asc' THEN created_at END ASC,
+    CASE WHEN $2 = 'desc' THEN created_at END DESC
+`
+
+type GetChirpsByUserIDParams struct {
+	UserID  uuid.UUID
+	Column2 interface{}
+}
+
+func (q *Queries) GetChirpsByUserID(ctx context.Context, arg GetChirpsByUserIDParams) ([]Chirp, error) {
+	rows, err := q.db.QueryContext(ctx, getChirpsByUserID, arg.UserID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Chirp
+	for rows.Next() {
+		var i Chirp
+		if err := rows.Scan(
+			&i.ID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.Body,
+			&i.UserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

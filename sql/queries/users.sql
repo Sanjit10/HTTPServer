@@ -31,3 +31,9 @@ SET email = $1,
     updated_at = now(),
     hashed_password = $2
 WHERE id = $3;
+
+
+-- name: SetUserIsChirpyRed :exec
+UPDATE users
+SET is_chirpy_red = $1
+WHERE id = $2;
