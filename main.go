@@ -38,6 +38,7 @@ type User struct {
 type contextKey string
 
 const userContextKey = contextKey("user")
+const tokenContextKey = contextKey("refresh_token")
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,24 +57,42 @@ func (cfg *apiConfig) middlewareJWTtokenValidator(next http.Handler) http.Handle
 		token, err := auth.GetBearerToken(r.Header)
 		if err != nil {
 			log.Printf("Error decoding headers: %s", err)
-			respondWithError(w, http.StatusBadRequest, "Invalid header")
+			respondWithError(w, http.StatusUnauthorized, "Invalid header")
 			return
 		}
 		user_uuid, err := auth.ValidateJWT(token, cfg.secret)
 		if err != nil {
 			log.Printf("Error validating: %s", err)
-			respondWithError(w, http.StatusBadRequest, "Invalid token")
+			respondWithError(w, http.StatusUnauthorized, "Invalid token")
 			return
 		}
 		user, db_err := cfg.dbQueries.GetUserById(r.Context(), user_uuid)
 		if db_err != nil {
 			log.Printf("Error fetching user: %s", err)
-			respondWithError(w, http.StatusBadRequest, "Invalid uuid")
+			respondWithError(w, http.StatusUnauthorized, "Invalid uuid")
 			return
 		}
 		ctx := context.WithValue(r.Context(), userContextKey, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (cfg *apiConfig) middlewareRefreshTokenValidation(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error decoding refresh token header: %s", err)
+			respondWithError(w, http.StatusUnauthorized, "Invalid refresh token header")
+			return
+		}
+		ctx := context.WithValue(r.Context(), tokenContextKey, refreshToken)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func getTokenFromContext(ctx context.Context) (string, bool) {
+	token, ok := ctx.Value(tokenContextKey).(string)
+	return token, ok
 }
 
 // respondWithJSON is a helper to send JSON responses
@@ -369,9 +388,8 @@ func main() {
 		// Decode body
 		defer r.Body.Close()
 		type reqBody struct {
-			Password  string `json:"password"`
-			Email     string `json:"email"`
-			ExpiresIn int    `json:"expires_in_seconds"`
+			Password string `json:"password"`
+			Email    string `json:"email"`
 		}
 		decoder := json.NewDecoder(r.Body)
 		var decodedBody reqBody
@@ -406,16 +424,14 @@ func main() {
 			return
 		}
 		type RespBody struct {
-			ID        uuid.UUID `json:"id"`
-			CreatedAt time.Time `json:"created_at"`
-			UpdatedAt time.Time `json:"updated_at"`
-			Email     string    `json:"email"`
-			Token     string    `json:"token"`
+			ID           uuid.UUID `json:"id"`
+			CreatedAt    time.Time `json:"created_at"`
+			UpdatedAt    time.Time `json:"updated_at"`
+			Email        string    `json:"email"`
+			Token        string    `json:"token"`
+			RefreshToken string    `json:"refresh_token"`
 		}
 		expires_in := 60 * 60 //seconds
-		if decodedBody.ExpiresIn != 0 && decodedBody.ExpiresIn < expires_in {
-			expires_in = decodedBody.ExpiresIn
-		}
 		token, err_token := auth.MakeJWT(
 			user.ID,
 			cfg.secret,
@@ -427,17 +443,93 @@ func main() {
 			return
 		}
 
+		refresh_token, err_refresh := auth.MakeRefreshToken()
+		if err_refresh != nil {
+			log.Printf("Refresh Token err: %s", err_refresh)
+			respondWithError(w, http.StatusUnauthorized, "Refresh Token err")
+			return
+		}
+		duration := 60 * 60 * 24 * 60
+		refresh_token_expiry := time.Now().Add(
+			time.Duration(duration) * time.Second)
+		_, db_err := cfg.dbQueries.CreateRefreshToken(
+			r.Context(),
+			database.CreateRefreshTokenParams{
+				Token:     refresh_token,
+				UserID:    user.ID,
+				ExpiresAt: refresh_token_expiry,
+			},
+		)
+		if db_err != nil {
+			log.Printf("Refresh Token err: %s", db_err)
+			respondWithError(w, http.StatusUnauthorized, "Refresh Token err")
+			return
+		}
+
 		respBody := RespBody{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
-			Token:     token,
+			ID:           user.ID,
+			CreatedAt:    user.CreatedAt,
+			UpdatedAt:    user.UpdatedAt,
+			Email:        user.Email,
+			Token:        token,
+			RefreshToken: refresh_token,
 		}
 		respondWithJSON(w, 200, respBody)
 
 	})
 	mux.Handle("POST /api/login", handelLogin)
+
+	handelRefresh := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshToken, ok := getTokenFromContext(r.Context())
+		if !ok || refreshToken == "" {
+			respondWithError(w, http.StatusUnauthorized, "No refresh token in context")
+			return
+		}
+
+		// Validate refresh token in DB
+		dbToken, err := cfg.dbQueries.GetValidToken(r.Context(), refreshToken)
+		if err != nil {
+			log.Printf("Invalid or expired refresh token: %s", err)
+			respondWithError(w, http.StatusUnauthorized, "Invalid or expired refresh token")
+			return
+		}
+
+		// Issue new access token
+		accessToken, err := auth.MakeJWT(
+			dbToken.UserID,
+			cfg.secret,
+			time.Hour, // 1 hour
+		)
+		if err != nil {
+			log.Printf("Error creating new access token: %s", err)
+			respondWithError(w, http.StatusInternalServerError, "Could not create access token")
+			return
+		}
+
+		type RespBody struct {
+			Token string `json:"token"`
+		}
+		respondWithJSON(w, http.StatusOK, RespBody{Token: accessToken})
+	})
+	mux.Handle("POST /api/refresh", cfg.middlewareRefreshTokenValidation(handelRefresh))
+
+	handelRevoke := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error accessing token: %s", err)
+			respondWithError(w, http.StatusUnauthorized, "Could not revoke refresh token")
+			return
+		}
+		revoke_err := cfg.dbQueries.RevokeToken(r.Context(), token)
+		if revoke_err != nil {
+			log.Printf("Error revoking token: %s", revoke_err)
+			respondWithError(w, http.StatusUnauthorized, "Could not revoke refresh token")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(204)
+	})
+	mux.Handle("POST /api/revoke", cfg.middlewareRefreshTokenValidation(handelRevoke))
 
 	server := &http.Server{
 		Addr:    ":8080",

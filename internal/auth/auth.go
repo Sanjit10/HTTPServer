@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -22,4 +25,12 @@ func VerifyPassword(hashedPassword, plainPassword string) (bool, error) {
 	return true, nil
 }
 
-
+func MakeRefreshToken() (string, error) {
+    rand_byte := make([]byte, 32) // 32 bytes for a secure token
+    _, err := rand.Read(rand_byte)
+    if err != nil {
+        return "", err
+    }
+    rand_token_string := hex.EncodeToString(rand_byte)
+    return rand_token_string, nil
+}
