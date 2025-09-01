@@ -531,6 +531,119 @@ func main() {
 	})
 	mux.Handle("POST /api/revoke", cfg.middlewareRefreshTokenValidation(handelRevoke))
 
+	handelEmailUpdate := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		user, ok := getUserFromContext(r.Context())
+		if !ok {
+			respondWithError(w, http.StatusUnauthorized, "No user in context")
+			return
+		}
+		type reqBody struct{
+			Password string `json:"password"`
+			Email	 string	`json:"email"`
+		}
+		reqBodyDecoder := json.NewDecoder(r.Body)
+		var decodedReqBody reqBody
+		if decode_err := reqBodyDecoder.Decode(&decodedReqBody); decode_err != nil {
+			log.Printf("Error decoding parameters: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Invalid JSON body") // Use helper, 400 status
+			return
+		}
+
+		hashedPassword, err := auth.HashPassword(decodedReqBody.Password)
+		if err != nil {
+			log.Printf("Error hashing password: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Error hashing password") // Use helper, 400 status
+			return
+		}
+
+		db_err := cfg.dbQueries.UpdateUser(r.Context(), database.UpdateUserParams{
+			Email: decodedReqBody.Email,
+			HashedPassword: hashedPassword,
+			ID: user.ID,
+		})
+		if db_err != nil {
+			log.Printf("Error updating user: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Error updating user") // Use helper, 400 status
+			return
+		}
+
+		updated_user, err := cfg.dbQueries.GetUserById(r.Context(), user.ID)
+		if err != nil {
+			log.Printf("Error updating user: %s", err)
+			respondWithError(w, http.StatusBadRequest, "Error updating user") // Use helper, 400 status
+			return
+		}
+		respUser := User{
+			ID: updated_user.ID,
+			CreatedAt: updated_user.CreatedAt,
+			UpdatedAt: updated_user.UpdatedAt,
+			Email: updated_user.Email,
+		}
+		// type respBody struct {
+		// 	User User `json:"user"`
+		// }
+		respondWithJSON(w, 200, respUser)
+
+	})
+	mux.Handle("PUT /api/users", cfg.middlewareJWTtokenValidator(handelEmailUpdate))
+
+	deleteChirpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	// Get user from context (auth middleware should have set this)
+	user, ok := getUserFromContext(r.Context())
+	if !ok {
+		respondWithError(w, http.StatusUnauthorized, "No user in context")
+		return
+	}
+
+	// Extract chirpID from URL
+	chirp_idStr := r.PathValue("chirp_id")
+	chirpID, err := uuid.Parse(chirp_idStr)
+	if err != nil {
+		respondWithError(w, 404, "Invalid UUID format")
+		return
+	}
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+
+	// Fetch chirp from DB
+	chirp, err := cfg.dbQueries.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "Chirp not found")
+			return
+		}
+		log.Printf("Error fetching chirp: %s", err)
+		respondWithError(w, http.StatusInternalServerError, "Error fetching chirp")
+		return
+	}
+
+	// Check ownership
+	if chirp.UserID != user.ID {
+		respondWithError(w, http.StatusForbidden, "Not authorized to delete this chirp")
+		return
+	}
+
+	// Delete chirp
+	err = cfg.dbQueries.DeleteChirp(r.Context(), chirpID)
+	if err != nil {
+		log.Printf("Error deleting chirp: %s", err)
+		respondWithError(w, http.StatusInternalServerError, "Error deleting chirp")
+		return
+	}
+
+	// Success, no content
+	w.WriteHeader(http.StatusNoContent)
+})
+
+// Register route
+mux.Handle("DELETE /api/chirps/{chirp_id}", cfg.middlewareJWTtokenValidator(deleteChirpHandler))
+
 	server := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,

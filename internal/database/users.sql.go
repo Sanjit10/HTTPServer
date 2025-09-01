@@ -96,3 +96,22 @@ func (q *Queries) SetUserPassword(ctx context.Context, arg SetUserPasswordParams
 	_, err := q.db.ExecContext(ctx, setUserPassword, arg.HashedPassword, arg.ID)
 	return err
 }
+
+const updateUser = `-- name: UpdateUser :exec
+UPDATE users
+SET email = $1,
+    updated_at = now(),
+    hashed_password = $2
+WHERE id = $3
+`
+
+type UpdateUserParams struct {
+	Email          string
+	HashedPassword string
+	ID             uuid.UUID
+}
+
+func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) error {
+	_, err := q.db.ExecContext(ctx, updateUser, arg.Email, arg.HashedPassword, arg.ID)
+	return err
+}
